@@ -13,6 +13,7 @@ import {
   OCPPAction,
   OCPPErrorCode,
   OCPPMessageType,
+  OCPPStatus,
 } from "../../domain/types/OcppTypes";
 
 import * as request from "@voltbras/ts-ocpp/dist/messages/json/request";
@@ -313,7 +314,7 @@ export class OCPPMessageHandler {
     this.sendRequest(OCPPAction.MeterValues, messageId, payload);
   }
 
-  public sendStatusNotification(connectorId: number, status: OCPPStatus): void {
+  public sendStatusNotification(connectorId: number, status: OCPPStatus, _previousStatus?: OCPPStatus): void {
     const messageId = this.generateMessageId();
     const payload: request.StatusNotificationRequest = {
       connectorId: connectorId,

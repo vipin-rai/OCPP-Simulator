@@ -45,6 +45,8 @@ export class Connector {
 
   private modeValue: ScenarioMode = "manual";
   private _scenarioManager?: ScenarioManager;
+  private _lockAmount = 5.0;
+  private _monitoringIntervalId: NodeJS.Timeout | null = null;
 
   constructor(private readonly connectorId: number, private readonly logger: Logger) {
     this.meterScheduler = new MeterValueScheduler(
@@ -118,10 +120,30 @@ export class Connector {
     this.transactionValue = transaction;
   }
 
+  get transactionId(): number | null {
+    return this.transactionValue?.id ?? null;
+  }
+
   set transactionId(transactionId: number | null) {
     if (!this.transactionValue) return;
     this.transactionValue.id = transactionId;
     this.eventsEmitter.emit("transactionIdChange", { transactionId });
+  }
+
+  get lockAmount(): number {
+    return this._lockAmount;
+  }
+
+  set lockAmount(value: number) {
+    this._lockAmount = value;
+  }
+
+  get monitoringIntervalId(): NodeJS.Timeout | null {
+    return this._monitoringIntervalId;
+  }
+
+  set monitoringIntervalId(value: NodeJS.Timeout | null) {
+    this._monitoringIntervalId = value;
   }
 
   get mode(): ScenarioMode {
@@ -210,7 +232,15 @@ export class Connector {
     return this._scenarioManager;
   }
 
+  clearMonitoringInterval(): void {
+    if (this._monitoringIntervalId) {
+      clearInterval(this._monitoringIntervalId);
+      this._monitoringIntervalId = null;
+    }
+  }
+
   cleanup(): void {
+    this.clearMonitoringInterval();
     this.meterScheduler.cleanup();
     if (this._scenarioManager) {
       this._scenarioManager.destroy();

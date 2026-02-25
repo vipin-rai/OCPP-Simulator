@@ -169,6 +169,15 @@ export class OCPPMessageHandler {
       console.log(`🛑 Monitoring stopped for tx ${transaction.id}`);
       this._logger.info(`🛑 Monitoring stopped for transaction ${transaction.id}`);
     }
+
+    // ✅ CLEAR PREPARING TIMEOUT if still pending
+    if (this.preparingTimeouts.has(connectorId)) {
+      const timeoutId = this.preparingTimeouts.get(connectorId);
+      if (timeoutId) clearTimeout(timeoutId);
+      this.preparingTimeouts.delete(connectorId);
+      this._logger.info(`⏹️ Cleared Preparing timeout for connector ${connectorId}`);
+    }
+
     this.sendRequest(OCPPAction.StopTransaction, messageId, payload, connectorId);
   }
 
@@ -243,6 +252,20 @@ export class OCPPMessageHandler {
       }),
     };
     this.sendRequest(OCPPAction.DataTransfer, messageId, payload, connectorId);
+  }
+
+  // Public helper for sending StartTransaction OCPP message
+  // Status transitions are handled by handleRemoteStartTransaction
+  public initiateStartTransaction(transaction: Transaction, connectorId: number): void {
+    const connector = this._chargePoint.getConnector(connectorId);
+    if (!connector) {
+      this._logger.error(`Cannot initiate start: connector ${connectorId} not found`);
+      return;
+    }
+
+    // ✅ Just send the StartTransaction OCPP message
+    // Status is already set to Charging by handleRemoteStartTransaction's 5-second timeout
+    this.startTransaction(transaction, connectorId);
   }
 
   // ===================== PRIVATE: SEND REQUEST =====================
@@ -336,12 +359,10 @@ export class OCPPMessageHandler {
         if (dataMatch) {
           const amount = parseFloat(dataMatch[1]);
           this._logger.log(`Updated transaction amount: ${amount}`);
-          // Save amount to ALL connectors (may be called before/during/after transaction)
-          // Don't check status - just store it so it's available when transaction starts
-          for (const c of Array.from(this._chargePoint.connectors.values())) {
-            (c as any).lockAmount = amount;
-            this._logger.info(`✅ Saved lockAmount=₹${amount} to connector ${c.id}`);
-          }
+          // NOTE: Per requirements, do NOT use DataTransfer to set lock amounts.
+          // The transaction API must be the single source of truth for `locked_amount`.
+          // We accept the TransactionAmount payload for informational purposes only.
+          this._logger.info(`Received TransactionAmount via DataTransfer (ignored for lock): ₹${amount}`);
           return { status: "Accepted" };
         }
       } catch (e) {
@@ -361,12 +382,34 @@ export class OCPPMessageHandler {
       return;
     }
 
+    // Resolve connectorId: prefer stored request.connectorId, fall back to
+    // searching connectors by transactionId present in the payload (if any).
+    let resolvedConnectorId: number | undefined = request.connectorId ?? undefined;
+    if (!resolvedConnectorId) {
+      const maybeTxId = (payload as any)?.transactionId as number | undefined;
+      if (maybeTxId) {
+        const found = Array.from(this._chargePoint.connectors.values()).find(
+          c => c.transaction?.id === maybeTxId || c.transactionId === maybeTxId
+        );
+        if (found) resolvedConnectorId = found.id;
+      }
+    }
+
     switch (request.action) {
       case OCPPAction.StartTransaction:
-        this.handleStartTransactionResponse(request.connectorId || 1, payload as response.StartTransactionResponse);
+        if (resolvedConnectorId === undefined) {
+          this._logger.error(`StartTransaction response received but connectorId could not be resolved for message ${messageId}`);
+        } else {
+          // fire-and-forget async handler
+          void this.handleStartTransactionResponse(resolvedConnectorId, payload as response.StartTransactionResponse);
+        }
         break;
       case OCPPAction.StopTransaction:
-        this.handleStopTransactionResponse(request.connectorId || 1, payload as response.StopTransactionResponse);
+        if (resolvedConnectorId === undefined) {
+          this._logger.error(`StopTransaction response received but connectorId could not be resolved for message ${messageId}`);
+        } else {
+          this.handleStopTransactionResponse(resolvedConnectorId, payload as response.StopTransactionResponse);
+        }
         break;
       case OCPPAction.DataTransfer:
         this.handleDataTransferResponse(payload as response.DataTransferResponse);
@@ -386,47 +429,73 @@ export class OCPPMessageHandler {
   private handleRemoteStartTransaction(payload: request.RemoteStartTransactionRequest): response.RemoteStartTransactionResponse {
     const connectorId = payload.connectorId || 1;
     const connector = this._chargePoint.getConnector(connectorId);
-     console.log("🔥 🔥 🔥 handleRemoteStartTransaction CALLED! vipivvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvpddddddddddddviffd");
+    const startTime = Date.now();
+    console.log("🔥 🔥 🔥 handleRemoteStartTransaction CALLED!");
+    console.log(`[RemoteStart] Time: ${startTime}, connectorId=${connectorId}, idTag=${payload.idTag}`);
     
     if (!connector || connector.availability !== "Operative") {
+      console.error(`[RemoteStart] REJECTED - connector unavailable`);
       return { status: "Rejected" };
     }
     
-    // ✅ STEP 1: Immediately set status to PREPARING
+    // ✅ STEP 1: Create transaction object IMMEDIATELY (but don't send OCPP message yet)
+    console.log(`[RemoteStart] Creating transaction object for connector ${connectorId}`);
+    const transaction: Transaction = {
+      id: 0,
+      connectorId: connectorId,
+      tagId: payload.idTag,
+      meterStart: 0,
+      meterStop: null,
+      startTime: new Date(),
+      stopTime: null,
+      meterSent: false,
+    };
+    connector.transaction = transaction;
+    console.log(`[RemoteStart] Transaction object created and assigned to connector`);
+    
+    // ✅ STEP 2: Immediately set status to PREPARING and send notification
+    console.log(`[RemoteStart] Setting connector status to PREPARING`);
     connector.status = OCPPStatus.Preparing;
     this.sendStatusNotification(connectorId, OCPPStatus.Preparing);
     this._logger.info(`🔌 Connector ${connectorId} status set to PREPARING`);
-    console.log(`🔌 PREPARING: Waiting 5 seconds for EV connection simulation...`);
+    console.log(`🔌 PREPARING: Waiting 5 seconds...`);
     
-    // ✅ STEP 2: After 5 seconds, transition to CHARGING (notify backend) then send StartTransaction
+    // ✅ STEP 3: After 5 seconds, change status to CHARGING, then send StartTransaction OCPP message
+    console.log(`[RemoteStart] Setting 5-second timeout...`);
+    
     const timeoutId = setTimeout(() => {
-      // Clean up
+      const elapsedMs = Date.now() - startTime;
+      console.log(`\n⏰⏰⏰ [5SEC TIMEOUT FIRED] After ${elapsedMs}ms for connector ${connectorId} ⏰⏰⏰\n`);
+      
       this.preparingTimeouts.delete(connectorId);
-
-      if (connector.availability !== "Operative") {
-        console.log(`❌ Connector became unavailable - canceling charging`);
-        this._logger.info(`❌ Connector ${connectorId} became unavailable during Preparing`);
+      
+      const freshConnector = this._chargePoint.getConnector(connectorId);
+      if (!freshConnector || !freshConnector.transaction) {
+        console.error(`[Timeout] ERROR: Connector or transaction not found!`);
         return;
       }
-
-      console.log(`✅ 5 seconds elapsed - Transitioning to CHARGING and sending StartTransaction...`);
-      this._logger.info(`✅ 5 seconds elapsed - Transitioning to CHARGING for connector ${connectorId}`);
-
-      // Set status to CHARGING and notify backend BEFORE sending StartTransaction CALL
-      connector.status = OCPPStatus.Charging;
+      
+      if (freshConnector.availability !== "Operative") {
+        console.log(`[Timeout] Connector became unavailable - aborting`);
+        return;
+      }
+      
+      console.log(`[Timeout] Setting status to CHARGING`);
+      freshConnector.status = OCPPStatus.Charging;
       this.sendStatusNotification(connectorId, OCPPStatus.Charging);
-      this._logger.info(`⚡ Status notification sent: CHARGING on connector ${connectorId}`);
-      console.log(`⚡ Status changed to: CHARGING`);
-
-      // Now send StartTransaction CALL to CSMS (backend also watches this CALL)
-      this._chargePoint.startTransaction(payload.idTag, connectorId);
-
-      // StartTransaction response handler will attach transactionId and start monitoring
+      this._logger.info(`⚡ Status changed to CHARGING on connector ${connectorId}`);
+      console.log(`⚡ Status is now: CHARGING`);
+      
+      // NOW send the StartTransaction OCPP message
+      console.log(`[Timeout] Sending StartTransaction OCPP message`);
+      this.startTransaction(freshConnector.transaction as Transaction, connectorId);
+      console.log(`[Timeout] StartTransaction OCPP message sent\n`);
+      
     }, 5000);
-
-    // Store timeout so we can cancel it if RemoteStop is called during Preparing
+    
     this.preparingTimeouts.set(connectorId, timeoutId);
-
+    console.log(`[RemoteStart] Timeout stored, returning Accepted\n`);
+    
     return { status: "Accepted" };
   }
 
@@ -493,100 +562,108 @@ export class OCPPMessageHandler {
     this._logger.log(`DataTransfer response: ${JSON.stringify(payload)}`);
   }
 
- private handleStartTransactionResponse(connectorId: number, payload: response.StartTransactionResponse): void {
-  console.log("🚀 START TRANSACTION RESPONSE CALLED!");
-  console.log("Payload:", JSON.stringify(payload, null, 2));
+ private async handleStartTransactionResponse(connectorId: number, payload: response.StartTransactionResponse): Promise<void> {
+  console.log(`[StartTransactionResponse] txID=${payload.transactionId}, idTagStatus=${payload.idTagInfo?.status}`);
   this._logger.info(`StartTransaction response: txID=${payload.transactionId}, status=${payload.idTagInfo?.status}`);
-  
+
   const connector = this._chargePoint.getConnector(connectorId);
   if (!connector) {
-    console.log("❌ Connector not found!");
     this._logger.error(`Connector ${connectorId} not found - cannot start monitoring`);
+    console.error(`[StartTransactionResponse] Connector ${connectorId} not found`);
     return;
   }
-  
-  console.log("✅ Connector found:", connectorId);
-  
+
   if (payload.idTagInfo?.status === "Accepted") {
-    console.log("✅ STATUS ACCEPTED! Transaction ID:", payload.transactionId);
     connector.transactionId = payload.transactionId;
-    connector.status = OCPPStatus.Charging;
+
+    // Status is already set to Charging by initiateStartTransaction's 5-second timeout
+    // Do NOT change status here - just start monitoring
+    this._logger.info(`✅ StartTransaction accepted for tx ${payload.transactionId} on connector ${connectorId}`);
+    this._logger.info(`💰 Starting cost monitoring for txID=${payload.transactionId}, connectorID=${connectorId}`);
+    console.log(`[StartTransactionResponse] Transaction accepted - status is: ${connector.status}, starting monitoring...`);
     
-    // ✅ SEND STATUS NOTIFICATION: CHARGING
-    this.sendStatusNotification(connectorId, OCPPStatus.Charging);
-    this._logger.info(`⚡ Status notification sent: CHARGING on connector ${connectorId}`);
-    console.log(`⚡ Status changed to: CHARGING`);
+    // ✅ UPDATE BACKEND DATABASE STATUS TO "LIVE"
+    await this.updateTransactionStatusToLive(payload.transactionId, connectorId);
     
-    // Lock amount: prefer connector value (from DataTransfer), else default ₹5
-    let lockAmount = (connector as any).lockAmount || 5.0;
-    console.log("💰 Lock Amount Set:", lockAmount);
-    this._logger.info(`💰 Lock Amount: ₹${lockAmount} for transaction ${payload.transactionId}`);
-    console.log("🔥 Starting cost monitoring...");
-    this._logger.info(`🔥 Starting cost monitoring for txID=${payload.transactionId}, connectorID=${connectorId}, lockAmount=₹${lockAmount}`);
-    this.startCostMonitoring(connectorId, payload.transactionId, lockAmount);
-    
-    // Async: Try to fetch locked_amount from API in background (don't block)
-    (async () => {
-      try {
-        const EXTERNAL_BASE = 'http://192.168.1.44:8099/RB';
-        const apiUrl = `${EXTERNAL_BASE}/api/app/vehicles/transaction/${payload.transactionId}`;
-        const resp = await fetch(apiUrl, { method: 'GET', headers: { 'Accept': 'application/json' }, mode: 'cors' });
-        if (resp.ok) {
-          const data = await resp.json();
-          let apiLocked = data.locked_amount ?? data.lockAmount ?? data.lockamount ?? data.lock_amount;
-          if (typeof apiLocked === 'string') apiLocked = parseFloat(apiLocked as string);
-          if (typeof apiLocked === 'number' && !isNaN(apiLocked) && apiLocked !== lockAmount) {
-            (connector as any).lockAmount = apiLocked;
-            console.log(`💰 Updated lock amount from API to: ${apiLocked}`);
-            this._logger.info(`💰 Updated lock amount from API to: ₹${apiLocked}`);
-          }
-        }
-      } catch (e) {
-        // Silently fail - monitoring already started with default/DataTransfer amount
-      }
-    })();
+    // Start monitoring (no status change needed - already Charging from the 5s timeout)
+    this.startCostMonitoring(connectorId, payload.transactionId);
   } else {
-    console.log("❌ Status NOT Accepted:", payload.idTagInfo?.status);
     this._logger.error(`Transaction REJECTED: ${payload.idTagInfo?.status}`);
-    
-    // ❌ If rejected, revert status back to Available
     connector.status = OCPPStatus.Available;
     this.sendStatusNotification(connectorId, OCPPStatus.Available);
     this._logger.info(`🔌 Status reverted to AVAILABLE (transaction rejected)`);
+    console.log(`[StartTransactionResponse] Transaction rejected - status reverted to Available`);
   }
 }
 
-  private startCostMonitoring(connectorId: number, transactionId: number, lockAmount: number): void {
-  console.log(`🎯 COST MONITORING STARTED: TxID=${transactionId}, ConnID=${connectorId}, LockAmount=₹${lockAmount}`);
-  console.log(`📱 Browser hostname: ${typeof window !== 'undefined' ? window.location.hostname : 'N/A'}`);
+  // ✅ UPDATE BACKEND DATABASE TO "LIVE" STATUS WHEN TRANSACTION ACCEPTED
+  private async updateTransactionStatusToLive(transactionId: number, connectorId: number): Promise<void> {
+    const EXTERNAL_BASE = 'http://192.168.1.44:8099/RB';
+    const updateUrl = `${EXTERNAL_BASE}/api/app/vehicles/transaction/${transactionId}/status`;
+    
+    try {
+      console.log(`[UpdateStatus] Making API call to update transaction ${transactionId} to LIVE status`);
+      this._logger.info(`🔄 Updating backend database: transaction ${transactionId} status to LIVE`);
+      
+      const response = await fetch(updateUrl, {
+        method: 'PUT',
+        headers: { 
+          'Accept': 'application/json', 
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          status: 'LIVE',
+          connector_id: connectorId,
+          timestamp: new Date().toISOString()
+        }),
+        mode: 'cors'
+      });
+
+      if (response.ok) {
+        console.log(`[UpdateStatus] ✅ Backend database updated - transaction ${transactionId} status set to LIVE`);
+        this._logger.info(`✅ Backend database updated - transaction ${transactionId} is now LIVE`);
+      } else {
+        const errorText = await response.text();
+        console.warn(`[UpdateStatus] ⚠️ Update response ${response.status}: ${errorText.substring(0, 100)}`);
+        this._logger.warn(`Backend status update returned ${response.status}: ${errorText.substring(0, 100)}`);
+      }
+    } catch (error) {
+      console.error(`[UpdateStatus] ❌ Error updating transaction status:`, error);
+      this._logger.error(`Error updating transaction status to LIVE: ${error}`);
+      // Don't let this error block the monitoring - continue anyway
+    }
+  }
+
+  private startCostMonitoring(connectorId: number, transactionId: number, _initialLockAmount?: number): void {
   this._logger.info(`=== COST MONITORING SESSION START ===`);
-  this._logger.info(`Transaction: ${transactionId} | Connector: ${connectorId} | Lock Limit: ₹${lockAmount}`);
+  this._logger.info(`Transaction: ${transactionId} | Connector: ${connectorId}`);
 
   const EXTERNAL_BASE = 'http://192.168.1.44:8099/RB';
-  const runningLocally = typeof window !== 'undefined' && (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1');
-  console.log(`🔍 Running locally? ${runningLocally}`);
-  
+
   let isStopped = false;
   let checkCount = 0;
 
   const interval = setInterval(async () => {
     checkCount++;
-    const timestamp = new Date().toLocaleTimeString();
-    console.log(`⏰ CHECK #${checkCount} at ${timestamp}`);
 
     if (isStopped) {
-      console.log(`⛔ Monitoring already stopped for tx ${transactionId}`);
       clearInterval(interval);
       return;
     }
 
+    // If the connector no longer has an active transaction, stop monitoring
+    const connector = this._chargePoint.getConnector(connectorId);
+    if (!connector || !connector.transaction) {
+      isStopped = true;
+      clearInterval(interval);
+      this.monitoringIntervals.delete(transactionId);
+      this._logger.info(`🛑 Monitoring stopped - no active transaction on connector ${connectorId}`);
+      return;
+    }
+
     try {
-      const apiPath = `/api/app/vehicles/transaction/${transactionId}`;
-      const apiUrl = runningLocally ? apiPath : `${EXTERNAL_BASE}${apiPath}`;
-      console.log(`🌐 FETCHING: ${apiUrl}`);
-      console.log(`   📍 TransactionID: ${transactionId}, ConnectorID: ${connectorId}, LockAmount: ₹${lockAmount}`);
-      this._logger.info(`[Check #${checkCount}] API Call - TxID=${transactionId}, Conn=${connectorId}, Lock=₹${lockAmount}`);
-      this._logger.info(`[Check #${checkCount}] Fetching from: ${apiUrl}`);
+      const apiUrl = `${EXTERNAL_BASE}/api/app/vehicles/transaction/${transactionId}`;
+      this._logger.info(`[Check #${checkCount}] Fetching: ${apiUrl}`);
 
       const response = await fetch(apiUrl, {
         method: 'GET',
@@ -594,109 +671,126 @@ export class OCPPMessageHandler {
         mode: 'cors'
       });
 
-      console.log(`📡 Response status: ${response.status} ${response.statusText}`);
       this._logger.info(`[Check #${checkCount}] HTTP ${response.status}`);
 
       if (!response.ok) {
-        console.error(`❌ API ERROR: ${response.status} ${response.statusText}`);
         const errorText = await response.text();
-        console.error('Error body:', errorText.substring(0, 200));
         this._logger.error(`[Check #${checkCount}] API ERROR ${response.status}: ${errorText.substring(0, 100)}`);
         return;
       }
 
       const data = await response.json();
-      console.log(`📊 API RESPONSE:`, JSON.stringify(data, null, 2));
 
-      // Validate API response structure
       if (!data || typeof data !== 'object') {
-        console.warn('⚠️ Invalid API response structure - expected object');
         this._logger.warn(`[Check #${checkCount}] Invalid response structure`);
         return;
       }
 
-      const currentRevenue = data.revenue_amount;
-      const apiStatus = data.status;
+      // Update connector lock amount if API provides one (keeps monitoring limit accurate)
+      const apiLockedRaw2 = data.locked_amount ?? data.lockAmount ?? data.lockamount ?? data.lock_amount;
+      const apiLocked2 = this.parseNumber(apiLockedRaw2);
 
-      if (typeof currentRevenue !== 'number' || currentRevenue === null || currentRevenue === undefined) {
-        console.warn(`⚠️ Missing or invalid revenue_amount in response:`, data);
-        this._logger.warn(`[Check #${checkCount}] Invalid revenue_amount: ${currentRevenue}`);
+      if (typeof apiLocked2 !== 'number') {
+        // No lock amount provided yet by API — keep waiting and do not apply any default.
+        this._logger.info(`[Check #${checkCount}] No locked_amount yet from API for tx ${transactionId}; still waiting (connector remains PREPARING)`);
         return;
       }
 
-      // ✅ CRITICAL: Stop monitoring if status is not LIVE (charging stopped on backend)
+  
+      if (apiLocked2 !== connector.lockAmount) {
+        connector.lockAmount = apiLocked2;
+        // Mark that the lock was sourced from the authoritative transaction API
+        (connector as any).lockSetByApi = true;
+        this._logger.info(`💰 Applied connector ${connectorId} lockAmount from API: ₹${apiLocked2}`);
+      }
+
+      // NOW that we have a locked_amount, apply it to the connector
+      // Status is already Charging from the 5-second timeout in initiateStartTransaction
+      if (connector.status === OCPPStatus.Preparing) {
+        // This shouldn't happen now, but keep as safety net
+        connector.status = OCPPStatus.Charging;
+        this.sendStatusNotification(connectorId, OCPPStatus.Charging);
+        this._logger.info(`⚡ Status changed to CHARGING on connector ${connectorId}`);
+      }
+
+      // Parse revenue for limit checking (may not be available on first check)
+      let currentRevenue: number | null = null;
+      if (data.revenue_amount !== undefined) currentRevenue = this.parseNumber(data.revenue_amount);
+      if ((currentRevenue === null || isNaN(currentRevenue)) && data.revenue !== undefined) currentRevenue = this.parseNumber(data.revenue);
+
+      const apiStatus = data.status;
+
+      if (currentRevenue === null || isNaN(currentRevenue)) {
+        this._logger.warn(`[Check #${checkCount}] No valid revenue_amount yet (${String(data.revenue_amount ?? data.revenue)}) — will retry`);
+        // Continue monitoring even if revenue is not yet available
+        return;
+      }
+
+      // Stop monitoring if status is not LIVE (charging stopped on backend)
       if (apiStatus !== "LIVE") {
-        console.log(`🛑 API Status is NOT LIVE (${apiStatus}) - STOPPING MONITORING`);
-        this._logger.info(`🛑 Charging stopped on backend (status=${apiStatus}) - stopping monitoring for tx ${transactionId}`);
+        this._logger.info(`🛑 Charging not LIVE (status=${apiStatus}) - stopping monitoring for tx ${transactionId}`);
         isStopped = true;
         clearInterval(interval);
         this.monitoringIntervals.delete(transactionId);
         return;
       }
 
-      console.log(`💵 REVENUE CHECK: ₹${currentRevenue} / Lock: ₹${lockAmount} | Status: ${apiStatus}`);
-      console.log(`   ✓ currentRevenue=${currentRevenue} (type: ${typeof currentRevenue})`);
-      console.log(`   ✓ lockAmount=${lockAmount} (type: ${typeof lockAmount})`);
-      console.log(`   ✓ Comparison: ${currentRevenue} >= ${lockAmount} = ${currentRevenue >= lockAmount}`);
-      this._logger.info(`[Check #${checkCount}] Revenue: ₹${currentRevenue} (Limit: ₹${lockAmount}) | API Status: ${apiStatus}`);
+      const effectiveLock = connector.lockAmount as number;
+      this._logger.info(`[Check #${checkCount}] Revenue: ₹${currentRevenue} (Limit: ₹${effectiveLock}) | API Status: ${apiStatus}`);
 
-      // CRITICAL: If revenue >= lock amount, STOP IMMEDIATELY
-      if (currentRevenue >= lockAmount) {
-        console.log(`💰💥 ⚡ LIMIT REACHED! Revenue ₹${currentRevenue} >= Lock ₹${lockAmount} - STOPPING NOW!`);
-        this._logger.error(`💥 CHARGING LIMIT REACHED! ₹${currentRevenue} >= ₹${lockAmount}`);
-        
+      // CRITICAL: If revenue >= lock amount, STOP THIS CONNECTOR ONLY
+      if (currentRevenue >= effectiveLock) {
+        this._logger.error(`💥 CHARGING LIMIT REACHED on connector ${connectorId}! ₹${currentRevenue} >= ₹${effectiveLock}`);
+
         isStopped = true;
         clearInterval(interval);
-        this.monitoringIntervals.delete(transactionId); // Remove from tracking
-        this._logger.info(`🛑 Cleared monitoring interval - preparing auto-stop`);
-        
-        await this.triggerAutoStop(transactionId, connectorId, currentRevenue, lockAmount);
+        this.monitoringIntervals.delete(transactionId);
+
+        await this.triggerAutoStop(transactionId, connectorId, currentRevenue, effectiveLock);
         return;
       } else {
-        const remaining = (lockAmount - currentRevenue).toFixed(2);
-        console.log(`⏳ Continuing... Remaining: ₹${remaining}`);
-        this._logger.debug(`[Check #${checkCount}] Remaining: ₹${remaining}`);
+        const remaining = (effectiveLock - currentRevenue).toFixed(2);
+        this._logger.debug(`[Check #${checkCount}] Connector ${connectorId} remaining: ₹${remaining}`);
       }
 
     } catch (error) {
-      console.error(`💥 FETCH ERROR:`, error);
-      this._logger.error(`[Check #${checkCount}] Exception: ${error instanceof Error ? error.message : String(error)}`);
+      this._logger.error(`[Check #${checkCount}] Connector ${connectorId} exception: ${error instanceof Error ? error.message : String(error)}`);
     }
-  }, 10000); // Check every 10 seconds exactly
+  }, 5000); // Check every 5 seconds
 
   // Store interval so we can clear it on stopTransaction
   this.monitoringIntervals.set(transactionId, interval);
   this.monitoringTransactions.add(transactionId);
 
-  console.log(`✅ Monitoring started | Interval: 10 seconds`);
-  this._logger.info(`✅ Monitoring started - checks every 10 seconds`);
+  this._logger.info(`✅ Monitoring started for connector ${connectorId} - checks every 5 seconds`);
 }
 
   private async triggerAutoStop(transactionId: number, connectorId: number, currentRevenue: number, lockAmount: number): Promise<void> {
-  console.log(`🛑 AUTO-STOP TRIGGERED: TxID=${transactionId}, Revenue=₹${currentRevenue}, Lock=₹${lockAmount}`);
-  this._logger.error(`🛑 AUTO-STOP INITIATED for transaction ${transactionId}`);
+  this._logger.error(`🛑 AUTO-STOP INITIATED for transaction ${transactionId} on connector ${connectorId}`);
 
   try {
-    const transaction: Transaction = {
-      id: transactionId,
-      tagId: 'AUTO_STOP',
-      meterStart: 0,
-      meterStop: Math.floor(currentRevenue * 1000), // Mock meter value
-      startTime: new Date(Date.now() - 600000),
-      stopTime: new Date(),
-      chargeBoxId: parseInt(this._chargePoint.id) || 131315
-    };
+    // Use the connector's actual transaction if available, otherwise create a fallback
+    const connector = this._chargePoint.getConnector(connectorId);
+    if (connector && connector.transaction) {
+      this._logger.info(`🚫 Stopping transaction ${transactionId} on connector ${connectorId}`);
+      this._chargePoint.stopTransaction(connector);
+    } else {
+      // Fallback: create a minimal transaction for the StopTransaction message
+      const transaction: Transaction = {
+        id: transactionId,
+        tagId: 'AUTO_STOP',
+        meterStart: 0,
+        meterStop: Math.floor(currentRevenue * 1000),
+        startTime: new Date(Date.now() - 600000),
+        stopTime: new Date(),
+        chargeBoxId: parseInt(this._chargePoint.id) || 131315
+      };
+      this.stopTransaction(transaction, connectorId);
+    }
 
-    console.log(`🚫 Calling stopTransaction with:`, JSON.stringify(transaction, null, 2));
-    this._logger.info(`🚫 Sending StopTransaction: txID=${transactionId}, connID=${connectorId}`);
-    
-    this.stopTransaction(transaction, connectorId);
-
-    console.log(`✅ AUTO-STOP COMPLETE! Transaction ${transactionId} stopped.`);
-    this._logger.error(`✅ AUTO-STOP COMPLETE! Charging stopped for transaction ${transactionId}`);
+    this._logger.info(`✅ AUTO-STOP COMPLETE for transaction ${transactionId} on connector ${connectorId}`);
   } catch (error) {
-    console.error(`❌ AUTO-STOP FAILED:`, error);
-    this._logger.error(`❌ AUTO-STOP ERROR: ${error instanceof Error ? error.message : String(error)}`);
+    this._logger.error(`❌ AUTO-STOP ERROR on connector ${connectorId}: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
 
@@ -705,16 +799,32 @@ export class OCPPMessageHandler {
 
   private handleStopTransactionResponse(connectorId: number, _payload: response.StopTransactionResponse): void {
     const connector = this._chargePoint.getConnector(connectorId);
-    if (connector) {
-      connector.transaction = null;
-      connector.transactionId = null;
-      connector.status = OCPPStatus.Available;
-      
-      // ✅ SEND STATUS NOTIFICATION: AVAILABLE
-      this.sendStatusNotification(connectorId, OCPPStatus.Available);
-      this._logger.info(`✅ Status changed to AVAILABLE on connector ${connectorId}`);
-      console.log(`✅ Status: AVAILABLE (Transaction stopped)`);
+    if (!connector) return;
+
+    // Clear Preparing timeout if still active
+    if (this.preparingTimeouts.has(connectorId)) {
+      const timeoutId = this.preparingTimeouts.get(connectorId);
+      if (timeoutId) clearTimeout(timeoutId);
+      this.preparingTimeouts.delete(connectorId);
     }
+
+    // Clear cost monitoring for THIS connector's transaction only
+    if (connector.transaction?.id) {
+      const txId = connector.transaction.id;
+      if (this.monitoringIntervals.has(txId)) {
+        const interval = this.monitoringIntervals.get(txId);
+        if (interval) clearInterval(interval);
+        this.monitoringIntervals.delete(txId);
+        this.monitoringTransactions.delete(txId);
+      }
+    }
+
+    connector.transaction = null;
+    connector.transactionId = null;
+    connector.status = OCPPStatus.Available;
+
+    this.sendStatusNotification(connectorId, OCPPStatus.Available);
+    this._logger.info(`✅ Status changed to AVAILABLE on connector ${connectorId}`);
   }
 
   // ===================== UTILS =====================
@@ -746,5 +856,18 @@ export class OCPPMessageHandler {
       case "array": return (value as ArrayConfigurationValue).value.join(",");
       default: return "";
     }
+  }
+
+  // Parse numbers from API fields robustly (accept numbers, numeric strings, or strings with currency)
+  private parseNumber(value: any): number | null {
+    if (typeof value === 'number') return value;
+    if (typeof value === 'string') {
+      // Remove non-numeric characters except dot and minus
+      const cleaned = value.replace(/[^0-9.\-]/g, "");
+      if (cleaned.length === 0) return null;
+      const n = parseFloat(cleaned);
+      return isNaN(n) ? null : n;
+    }
+    return null;
   }
 }  

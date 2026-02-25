@@ -8,6 +8,11 @@ export class Connector {
   private _availability: OCPPAvailability;
   private _meterValue: number;
   private _transaction: Transaction | null;
+  private _lockAmount: number = 5.0;
+  // Indicates whether the lock amount was set from the authoritative transaction API
+  public lockSetByApi: boolean = false;
+  // Optional stored monitoring interval id (used by some handlers)
+  public monitoringIntervalId: NodeJS.Timeout | null = null;
 
   private _transactionIDChangeCallbacks: ((
     transactionId: number | null,
@@ -40,6 +45,10 @@ export class Connector {
   }
 
   set status(newStatus: ocpp.OCPPStatus) {
+    if (this._status !== newStatus) {
+      console.log(`[CONNECTOR ${this._id}] 🔄 Status change: "${this._status}" → "${newStatus}"`);
+      console.log(`[CONNECTOR ${this._id}] Stack:`, new Error().stack?.split('\n').slice(1, 4).join('\n'));
+    }
     this._status = newStatus;
     this._statusChangeCallbacks &&
       this._statusChangeCallbacks.forEach((callback) => {
@@ -97,5 +106,21 @@ export class Connector {
 
   public setMeterValueChangeCallbacks(callback: (meterValue: number) => void) {
     this._meterValueChangeCallbacks.push(callback);
+  }
+
+  get lockAmount(): number {
+    return this._lockAmount;
+  }
+
+  set lockAmount(value: number) {
+    this._lockAmount = value;
+  }
+
+  // Clear any monitoring interval stored on the connector
+  public clearMonitoringInterval(): void {
+    if (this.monitoringIntervalId) {
+      try { clearInterval(this.monitoringIntervalId); } catch {}
+      this.monitoringIntervalId = null;
+    }
   }
 }

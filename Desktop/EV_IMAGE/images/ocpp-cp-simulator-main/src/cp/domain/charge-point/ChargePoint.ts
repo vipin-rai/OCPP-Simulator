@@ -162,6 +162,10 @@ export class ChargePoint {
     return this._reservationManager;
   }
 
+  get messageHandler(): OCPPMessageHandler {
+    return this._messageHandler;
+  }
+
   set loggingCallback(callback: (entry: LogEntry) => void) {
     this._logger._loggingCallback = callback;
   }
@@ -190,7 +194,12 @@ export class ChargePoint {
   boot(): void {
     this._messageHandler.sendBootNotification(this._bootNotification);
     this.status = OCPPStatus.Available;
-    this.updateAllConnectorsStatus(OCPPStatus.Available);
+    // Only reset idle connectors — preserve active charging sessions
+    this._connectors.forEach((connector, connectorId) => {
+      if (!connector.transaction) {
+        this.updateConnectorStatus(connectorId, OCPPStatus.Available);
+      }
+    });
     this.error = "";
   }
 
@@ -216,7 +225,10 @@ export class ChargePoint {
     this._status = newStatus;
     if (newStatus === OCPPStatus.Unavailable) {
       this._connectors.forEach((connector) => {
-        connector.status = OCPPStatus.Unavailable;
+        // Preserve status of connectors with active transactions
+        if (!connector.transaction) {
+          connector.status = OCPPStatus.Unavailable;
+        }
       });
     }
     this._events.emit("statusChange", { status: newStatus });
@@ -281,6 +293,9 @@ export class ChargePoint {
       );
       return;
     }
+
+    // Clear cost monitoring interval for THIS connector only
+    connector.clearMonitoringInterval();
 
     connector.stopAutoMeterValue();
     transaction.stopTime = new Date();
@@ -370,7 +385,13 @@ export class ChargePoint {
   }
 
   updateAllConnectorsStatus(status: OCPPStatus): void {
-    this._connectors.forEach((connector) => this.updateConnectorStatus(connector.id, status));
+    this._connectors.forEach((connector) => {
+      // Skip connectors with active transactions to maintain independent session state
+      if (connector.transaction) {
+        return;
+      }
+      this.updateConnectorStatus(connector.id, status);
+    });
   }
 
   updateConnectorStatus(connectorId: number, status: OCPPStatus): void {

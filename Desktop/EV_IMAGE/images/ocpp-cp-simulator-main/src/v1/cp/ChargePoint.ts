@@ -151,7 +151,12 @@ export class ChargePoint {
   public boot(): void {
     this._messageHandler.sendBootNotification(this._bootNotification);
     this.status = OCPPStatus.Available;
-    this.updateAllConnectorsStatus(OCPPStatus.Available);
+    // Only reset idle connectors — preserve active charging sessions
+    this._connectors.forEach((connector, connectorId) => {
+      if (!connector.transaction) {
+        this.updateConnectorStatus(connectorId, OCPPStatus.Available);
+      }
+    });
     this.error = "";
   }
 
@@ -172,6 +177,14 @@ export class ChargePoint {
 
   set status(status: OCPPStatus) {
     this._status = status;
+    if (status === OCPPStatus.Unavailable) {
+      // Preserve status of connectors with active transactions
+      this._connectors.forEach((connector) => {
+        if (!connector.transaction) {
+          connector.status = OCPPStatus.Unavailable;
+        }
+      });
+    }
     if (this._statusChangeCallback) {
       this._statusChangeCallback(status);
     }
@@ -180,24 +193,16 @@ export class ChargePoint {
   public startTransaction(tagId: string, connectorId: number): void {
     const connector = this.getConnector(connectorId);
     if (connector) {
-      const transaction: Transaction = {
-        id: 0,
-        connectorId: connectorId,
-        tagId: tagId,
-        meterStart: 0,
-        meterStop: null,
-        startTime: new Date(),
-        stopTime: null,
-        meterSent: false,
-      };
-      connector.transaction = transaction;
-      this._messageHandler.startTransaction(transaction, connectorId);
-      // this.updateConnectorStatus(connectorId, OCPPStatus.Preparing);
+      console.log(`[ChargePoint.startTransaction] Starting transaction on connector ${connectorId} with idTag: ${tagId}`);
+      
+      // Transaction object is already created by handleRemoteStartTransaction
+      // Just start auto meter value if configured
       if (
         this._autoMeterValueSetting !== null &&
         this._autoMeterValueSetting.interval !== 0 &&
         this._autoMeterValueSetting.value !== 0
       ) {
+        console.log(`[ChargePoint.startTransaction] Starting auto meter value tracking`);
         this.startAutoMeterValue(
           connectorId,
           this._autoMeterValueSetting.interval,
@@ -206,6 +211,7 @@ export class ChargePoint {
       }
     } else {
       this._logger.error(`Connector ${connectorId} not found`);
+      console.error(`[ChargePoint.startTransaction] Connector ${connectorId} not found`);
     }
   }
 
@@ -219,6 +225,7 @@ export class ChargePoint {
       connId = connectorId.id;
       connector = connectorId;
     }
+    console.log(`[CHARGEPOINT] stopTransaction called for connector ${connId}`);
     if (connector) {
       connector.transaction!.stopTime = new Date();
       connector.transaction!.meterStop = connector.meterValue;
@@ -227,7 +234,9 @@ export class ChargePoint {
     } else {
       this._logger.error(`Connector for id ${connId} not found`);
     }
-    this.updateConnectorStatus(connId, OCPPStatus.Available);
+    // Do not force-set status to Available here. The StopTransaction
+    // CallResult handler (or the backend) should determine and notify the
+    // final status for this connector to avoid affecting other connectors.
   }
 
   public cleanTransaction(connector: Connector | number): void {
@@ -317,10 +326,11 @@ export class ChargePoint {
 
   public updateAllConnectorsStatus(newStatus: OCPPStatus): void {
     this._connectors.forEach((connector) => {
+      // Skip connectors with active transactions to maintain independent session state
+      if (connector.transaction) {
+        return;
+      }
       connector.status = newStatus;
-      this.connectors.forEach((connector) => {
-        connector.status = newStatus;
-      });
       this._messageHandler.sendStatusNotification(connector.id, newStatus);
     });
   }

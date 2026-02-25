@@ -12,6 +12,7 @@ export class BootNotificationResultHandler
   ): void {
     if (payload.status === "Accepted") {
       context.logger.info("Boot notification successful", LogType.OCPP);
+      // updateAllConnectorsStatus skips connectors with active transactions
       context.chargePoint.updateAllConnectorsStatus(OCPPStatus.Available);
       context.chargePoint.status = OCPPStatus.Available;
     } else {

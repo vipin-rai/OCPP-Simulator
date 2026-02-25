@@ -26,7 +26,7 @@ export class DataTransferHandler
             // Persist amount to ALL connectors (may be called before/during/after transaction)
             // Don't check status - just store it so it's available when transaction starts
             for (const c of Array.from(context.chargePoint.connectors.values())) {
-              (c as any).lockAmount = amount;
+              c.lockAmount = amount;
               context.logger.info(`✅ Saved lockAmount=₹${amount} to connector ${c.id}`, LogType.OCPP);
             }
             return { status: "Accepted" };
