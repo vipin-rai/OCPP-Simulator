@@ -1,0 +1,29 @@
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "v22"
+      - name: Install dependencies
+        run: npm install && npm install -g vite
+      - name: Build
+        run: VITE_BASE_URL="/ocpp-cp-simulator" npm run build
+      - name: Copy index.html to 404.html for SPA routing
+        run: cp dist/index.html dist/404.html
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./dist
